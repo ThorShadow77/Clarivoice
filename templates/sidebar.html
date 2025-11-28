@@ -1,0 +1,29 @@
+<div class="sidenav">
+  <div class="header">
+    <h2>ClariVoice</h2>
+  </div><br>
+
+  <!-- Meetings Section -->
+  <button class="dropdown-btn">Meetings <i class="fa fa-caret-down"></i></button>
+  <div class="dropdown-container">
+    <a href="{{ url_for('my_meetings') }}" class="nav-link {% if request.path == url_for('my_meetings') %}active{% endif %}">My Meetings</a>
+    <a href="{{ url_for('shared') }}" class="nav-link {% if request.path == url_for('shared') %}active{% endif %}">Shared With Me</a>
+    <a href="{{ url_for('tasks') }}" class="nav-link {% if request.path == url_for('tasks') %}active{% endif %}">My Tasks</a>
+    <a href="{{ url_for('bookmarks') }}" class="nav-link {% if request.path == url_for('bookmarks') %}active{% endif %}">My Bookmarks</a>
+    <a href="{{ url_for('automations') }}" class="nav-link {% if request.path == url_for('automations') %}active{% endif %}">My Automations</a>
+  </div>
+
+  <!-- Workspace Section -->
+  <button class="dropdown-btn">Workspace <i class="fa fa-caret-down"></i></button>
+  <div class="dropdown-container">
+    <a href="{{ url_for('user_oriented') }}" class="nav-link {% if request.path == url_for('user_oriented') %}active{% endif %}">User Oriented</a>
+    <a href="{{ url_for('print_page') }}" class="nav-link {% if request.path == url_for('print_page') %}active{% endif %}">Print</a>
+    <a href="{{ url_for('view_page') }}" class="nav-link {% if request.path == url_for('view_page') %}active{% endif %}">View</a>
+  </div>
+
+  <a href="{{ url_for('index') }}" class="nav-link {% if request.path in ['/', url_for('index')] %}active{% endif %}">Back to Home</a>
+
+  <div class="footer-container">
+    <p>ClariVoice - Pro</p>
+  </div>
+</div>

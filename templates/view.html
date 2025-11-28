@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Transcripts</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+{% include 'sidebar.html' %}
+
+<div class="main transcripts-page">
+  <h2>Saved Transcripts</h2>
+  <p class="transcripts-lead">All audio captured on the home page is saved here once Vosk finishes transcribing it.</p>
+
+  {% if transcripts %}
+    <ul class="transcripts-list">
+      {% for transcript_id, transcript_text in transcripts|reverse %}
+        <li class="transcript-card">
+          <div class="transcript-card__header">
+            <span class="transcript-card__badge">#{{ transcript_id }}</span>
+            <span class="transcript-card__meta">Most recent entries appear first</span>
+          </div>
+          <p class="transcript-card__text">{{ transcript_text }}</p>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <div class="transcripts-empty">
+      <i class="fa fa-microphone-slash" aria-hidden="true"></i>
+      <p>No transcripts stored yet. Record or upload audio from the home page to see it here.</p>
+    </div>
+  {% endif %}
+</div>
+
+<script>
+  // Toggle dropdown menus
+  const dropdowns = document.getElementsByClassName("dropdown-btn");
+  for (let i = 0; i < dropdowns.length; i++) {
+    dropdowns[i].addEventListener("click", function() {
+      this.classList.toggle("active");
+      const content = this.nextElementSibling;
+      content.style.display = content.style.display === "block" ? "none" : "block";
+    });
+  }
+</script>
+
+</body>
+</html>

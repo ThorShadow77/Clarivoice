@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ClariVoice</title>
+
+  <!-- External resources -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+  <link href="https://fonts.googleapis.com/css2?family=Lato&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+{% include 'sidebar.html' %}
+
+  <div class="main">
+    <h2>Home Page</h2>
+    <p>Start a meeting</p>
+    <button class="new-meeting-btn">+ New Meeting</button>
+
+    <section class="content" style="display:flex; flex-direction:column; justify-content:center; align-items:center; height:80vh;">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="#222533" viewBox="0 0 24 24" width="80" height="80">
+        <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 14 0h-2zM11 18v3h2v-3h-2z"/>
+      </svg>
+
+      <h3>Upload Meeting Audio</h3>
+      <form id="uploadForm" action="/upload" method="POST" enctype="multipart/form-data">
+        <input type="file" name="audio" required>
+        <button type="submit" class="upload-btn">Upload & Transcribe</button>
+      </form>
+
+      <div id="transcript" class="transcript-box"></div>
+
+      <div class="mic-section">
+        <h3>Live Microphone Capture</h3>
+        <button type="button" id="micButton" class="upload-btn mic-btn" aria-pressed="false">
+          <i class="fa fa-microphone" aria-hidden="true"></i>
+          <span id="micButtonLabel">Start Recording</span>
+        </button>
+        <p id="recordingStatus" class="recording-status" aria-live="polite">
+          Tap the microphone to capture live audio and send it to Vosk.
+        </p>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    // Toggle dropdown menus
+    const dropdowns = document.getElementsByClassName("dropdown-btn");
+    for (let i = 0; i < dropdowns.length; i++) {
+      dropdowns[i].addEventListener("click", function() {
+        this.classList.toggle("active");
+        const content = this.nextElementSibling;
+        content.style.display = content.style.display === "block" ? "none" : "block";
+      });
+    }
+  </script>
+
+  <script>
+    // Upload form handling + microphone streaming to Vosk
+    const transcriptBox = document.getElementById("transcript");
+    const uploadForm = document.getElementById("uploadForm");
+    const DEFAULT_ERROR = "⚠️ Transcription failed, please try again.";
+
+    async function sendAudioToServer(formData) {
+      transcriptBox.textContent = "Transcribing...";
+      try {
+        const response = await fetch("/upload", { method: "POST", body: formData });
+        const payload = await response.json();
+        transcriptBox.textContent = payload.transcript || DEFAULT_ERROR;
+        return payload;
+      } catch (error) {
+        console.error("Transcription request failed:", error);
+        transcriptBox.textContent = DEFAULT_ERROR;
+        throw error;
+      }
+    }
+
+    uploadForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const formData = new FormData(uploadForm);
+      await sendAudioToServer(formData);
+    });
+
+    const micButton = document.getElementById("micButton");
+    const micLabel = document.getElementById("micButtonLabel");
+    const statusEl = document.getElementById("recordingStatus");
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    const TARGET_SAMPLE_RATE = 16000;
+
+    const recordingState = {
+      audioContext: null,
+      mediaStream: null,
+      source: null,
+      processor: null,
+      silence: null,
+      buffers: [],
+      sampleRate: TARGET_SAMPLE_RATE,
+      isRecording: false
+    };
+
+    function setMicIdle() {
+      if (!micButton) return;
+      micButton.classList.remove("is-recording");
+      micButton.setAttribute("aria-pressed", "false");
+      micButton.disabled = false;
+      if (micLabel) {
+        micLabel.textContent = "Start Recording";
+      }
+    }
+
+    function setMicRecording() {
+      if (!micButton) return;
+      micButton.classList.add("is-recording");
+      micButton.setAttribute("aria-pressed", "true");
+      micButton.disabled = false;
+      if (micLabel) {
+        micLabel.textContent = "Stop Recording";
+      }
+    }
+
+    function cleanupRecording() {
+      if (recordingState.processor) {
+        recordingState.processor.disconnect();
+        recordingState.processor.onaudioprocess = null;
+      }
+      if (recordingState.source) {
+        recordingState.source.disconnect();
+      }
+      if (recordingState.silence) {
+        recordingState.silence.disconnect();
+      }
+      if (recordingState.mediaStream) {
+        recordingState.mediaStream.getTracks().forEach((track) => track.stop());
+      }
+      if (recordingState.audioContext) {
+        recordingState.audioContext.close();
+      }
+      recordingState.audioContext = null;
+      recordingState.mediaStream = null;
+      recordingState.source = null;
+      recordingState.processor = null;
+      recordingState.silence = null;
+    }
+
+    function mergeBuffers(buffers) {
+      const totalLength = buffers.reduce((sum, buffer) => sum + buffer.length, 0);
+      const result = new Float32Array(totalLength);
+      let offset = 0;
+      buffers.forEach((buffer) => {
+        result.set(buffer, offset);
+        offset += buffer.length;
+      });
+      return result;
+    }
+
+    function downsampleBuffer(buffer, sampleRate, outSampleRate) {
+      if (!outSampleRate || outSampleRate >= sampleRate) {
+        return buffer;
+      }
+      const ratio = sampleRate / outSampleRate;
+      const newLength = Math.round(buffer.length / ratio);
+      const result = new Float32Array(newLength);
+      let offsetResult = 0;
+      let offsetBuffer = 0;
+      while (offsetResult < result.length) {
+        const nextOffset = Math.round((offsetResult + 1) * ratio);
+        let accum = 0;
+        let count = 0;
+        for (let i = offsetBuffer; i < nextOffset && i < buffer.length; i++) {
+          accum += buffer[i];
+          count += 1;
+        }
+        result[offsetResult] = count ? accum / count : 0;
+        offsetResult += 1;
+        offsetBuffer = nextOffset;
+      }
+      return result;
+    }
+
+    function writeString(view, offset, string) {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    }
+
+    function encodeWavSamples(samples, sampleRate) {
+      const buffer = new ArrayBuffer(44 + samples.length * 2);
+      const view = new DataView(buffer);
+      writeString(view, 0, "RIFF");
+      view.setUint32(4, 36 + samples.length * 2, true);
+      writeString(view, 8, "WAVE");
+      writeString(view, 12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeString(view, 36, "data");
+      view.setUint32(40, samples.length * 2, true);
+      let offset = 44;
+      for (let i = 0; i < samples.length; i += 1, offset += 2) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      }
+      return view.buffer;
+    }
+
+    function convertToWav(buffers, sampleRate) {
+      if (!buffers.length) {
+        return null;
+      }
+      const merged = mergeBuffers(buffers);
+      const needsDownsample = sampleRate > TARGET_SAMPLE_RATE;
+      const processed = needsDownsample
+        ? downsampleBuffer(merged, sampleRate, TARGET_SAMPLE_RATE)
+        : merged;
+      const finalRate = needsDownsample ? TARGET_SAMPLE_RATE : sampleRate;
+      return new Blob([encodeWavSamples(processed, finalRate)], { type: "audio/wav" });
+    }
+
+    async function uploadRecording(blob) {
+      if (!blob) {
+        throw new Error("Nothing to upload");
+      }
+      const formData = new FormData();
+      formData.append("audio", blob, `mic-recording-${Date.now()}.wav`);
+      await sendAudioToServer(formData);
+    }
+
+    async function startRecording() {
+      if (!micButton || recordingState.isRecording) {
+        return;
+      }
+      micButton.disabled = true;
+      if (statusEl) {
+        statusEl.textContent = "Requesting microphone access...";
+      }
+      try {
+        recordingState.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        recordingState.audioContext = new AudioContextClass({ sampleRate: TARGET_SAMPLE_RATE });
+        await recordingState.audioContext.resume();
+        recordingState.sampleRate = recordingState.audioContext.sampleRate;
+        recordingState.source = recordingState.audioContext.createMediaStreamSource(recordingState.mediaStream);
+        recordingState.processor = recordingState.audioContext.createScriptProcessor(4096, 1, 1);
+        recordingState.buffers = [];
+        recordingState.processor.onaudioprocess = (event) => {
+          recordingState.buffers.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+        };
+        recordingState.source.connect(recordingState.processor);
+        recordingState.silence = recordingState.audioContext.createGain();
+        recordingState.silence.gain.value = 0;
+        recordingState.processor.connect(recordingState.silence);
+        recordingState.silence.connect(recordingState.audioContext.destination);
+        recordingState.isRecording = true;
+        setMicRecording();
+        if (statusEl) {
+          statusEl.textContent = "Listening... tap again to stop.";
+        }
+      } catch (error) {
+        console.error("Unable to access microphone:", error);
+        cleanupRecording();
+        setMicIdle();
+        if (statusEl) {
+          statusEl.textContent = "Microphone access was blocked.";
+        }
+      } finally {
+        if (recordingState.isRecording && micButton) {
+          micButton.disabled = false;
+        }
+      }
+    }
+
+    async function stopRecording() {
+      if (!micButton || !recordingState.isRecording) {
+        return;
+      }
+      recordingState.isRecording = false;
+      micButton.disabled = true;
+      const buffers = recordingState.buffers;
+      const sampleRate = recordingState.sampleRate;
+      cleanupRecording();
+      setMicIdle();
+      if (statusEl) {
+        statusEl.textContent = "Processing audio...";
+      }
+      if (!buffers.length) {
+        if (statusEl) {
+          statusEl.textContent = "No audio detected. Please try again.";
+        }
+        micButton.disabled = false;
+        return;
+      }
+      try {
+        const wavBlob = convertToWav(buffers, sampleRate);
+        await uploadRecording(wavBlob);
+        if (statusEl) {
+          statusEl.textContent = "Transcription complete.";
+        }
+      } catch (error) {
+        console.error("Recording upload failed:", error);
+        if (statusEl) {
+          statusEl.textContent = "Recording upload failed.";
+        }
+      } finally {
+        recordingState.buffers = [];
+        micButton.disabled = false;
+      }
+    }
+
+    if (micButton) {
+      const micSupported = Boolean(
+        navigator.mediaDevices &&
+        navigator.mediaDevices.getUserMedia &&
+        AudioContextClass
+      );
+      if (!micSupported) {
+        micButton.disabled = true;
+        if (statusEl) {
+          statusEl.textContent = "Microphone recording not supported in this browser.";
+        }
+      } else {
+        micButton.addEventListener("click", () => {
+          if (recordingState.isRecording) {
+            stopRecording();
+          } else {
+            startRecording();
+          }
+        });
+      }
+    }
+  </script>
+</body>
+</html>
