@@ -1,1 +1,193 @@
+#!/usr/bin/env python
+import argparse
+import csv
+import os
+import time
+from datetime import datetime
+import pandas as pd
+import json
+
+# Prefer requests if available, otherwise provide a minimal fallback using urllib
+try:
+    import requests
+except Exception:
+    import urllib.request
+    import urllib.error
+    import uuid
+
+    class _Response:
+        def __init__(self, status, body, headers):
+            self.status_code = status
+            self._body = body
+            self.headers = headers
+
+        def raise_for_status(self):
+            if not (200 <= self.status_code < 300):
+                raise urllib.error.HTTPError("", self.status_code, "HTTP Error", self.headers, None)
+
+        def json(self):
+            # decode body and parse JSON
+            return json.loads(self._body.decode("utf-8") if isinstance(self._body, (bytes, bytearray)) else str(self._body))
+
+    class _RequestsFallback:
+        @staticmethod
+        def post(url, files=None, timeout=None):
+            # files is expected to be {'audio': (filename, fileobj, content_type)}
+            boundary = uuid.uuid4().hex
+            body_parts = []
+            if files:
+                for field, (filename, fileobj, content_type) in files.items():
+                    try:
+                        fileobj.seek(0)
+                    except Exception:
+                        pass
+                    part_head = []
+                    part_head.append(f"--{boundary}\r\n")
+                    part_head.append(f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n')
+                    part_head.append(f"Content-Type: {content_type}\r\n\r\n")
+                    body_parts.append("".join(part_head).encode("utf-8"))
+                    body_parts.append(fileobj.read())
+                    body_parts.append(b"\r\n")
+            body_parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+            data = b"".join(body_parts)
+
+            req = urllib.request.Request(url, data=data)
+            req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+            req.add_header("Content-Length", str(len(data)))
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    resp_body = resp.read()
+                    return _Response(resp.getcode(), resp_body, resp.headers)
+            except urllib.error.HTTPError as e:
+                # e.read() may be available to get body
+                body = b""
+                try:
+                    body = e.read()
+                except Exception:
+                    body = getattr(e, "body", b"")
+                return _Response(getattr(e, "code", 500), body, getattr(e, "headers", {}))
+
+    requests = _RequestsFallback()
+
+def post_audio(endpoint: str, path: str) -> tuple[bool, float, str, str]:
+    """
+    Returns (success, latency_ms, transcript, error)
+    success=True if JSON has "transcript" with non-empty string.
+    """
+    t0 = time.perf_counter()
+    error = ""
+    transcript = ""
+    success = False
+    try:
+        with open(path, "rb") as f:
+            files = {"audio": (os.path.basename(path), f, "audio/wav")}
+            r = requests.post(endpoint, files=files, timeout=120)
+        t1 = time.perf_counter()
+        latency_ms = (t1 - t0) * 1000.0
+        r.raise_for_status()
+        data = r.json()
+        transcript = (data.get("transcript") or "").strip()
+        success = bool(transcript)
+        if not success and not data.get("error"):
+            error = "Empty transcript"
+        elif not success and data.get("error"):
+            error = str(data.get("error"))
+        return success, latency_ms, transcript, error
+    except Exception as ex:
+        t1 = time.perf_counter()
+        latency_ms = (t1 - t0) * 1000.0
+        error = str(ex)
+        return False, latency_ms, "", error
+
+def ensure_dirs():
+    os.makedirs("results", exist_ok=True)
+    os.makedirs("system_transcripts", exist_ok=True)
+
+def main():
+    parser = argparse.ArgumentParser(description="STT Test Runner: error rate, latency, task completion")
+    parser.add_argument("--endpoint", default="http://127.0.0.1:5000/upload", help="Upload endpoint")
+    parser.add_argument("--audio_dir", default="test_audios", help="Directory with .wav files")
+    parser.add_argument("--repeat", type=int, default=3, help="Number of times to post each file")
+    args = parser.parse_args()
+
+    ensure_dirs()
+
+    audio_files = [f for f in os.listdir(args.audio_dir) if f.lower().endswith(".wav")]
+    audio_files.sort()
+    if not audio_files:
+        print("No .wav files found in test_audios/. Add files and re-run.")
+        return
+
+    attempt_log_path = os.path.join("results", "attempt_log.csv")
+    with open(attempt_log_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp","file","run","success","latency_ms","error"])
+
+    # Run tests
+    for fname in audio_files:
+        path = os.path.join(args.audio_dir, fname)
+        base = os.path.splitext(fname)[0]
+        last_success_transcript = None
+
+        for run in range(1, args.repeat + 1):
+            success, latency_ms, transcript, error = post_audio(args.endpoint, path)
+            timestamp = datetime.utcnow().isoformat()
+            with open(attempt_log_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([timestamp, fname, run, int(success), f"{latency_ms:.2f}", error])
+
+            if success:
+                last_success_transcript = transcript
+                # Also archive each run's transcript
+                per_run_out = os.path.join("system_transcripts", f"{base}__run{run}.txt")
+                with open(per_run_out, "w", encoding="utf-8") as wf:
+                    wf.write(transcript)
+
+        # Save the latest successful transcript as the canonical hypothesis
+        if last_success_transcript:
+            out_path = os.path.join("system_transcripts", f"{base}.txt")
+            with open(out_path, "w", encoding="utf-8") as wf:
+                wf.write(last_success_transcript)
+
+    # Aggregate attempt log
+    df = pd.read_csv(attempt_log_path)
+    # Cast numeric
+    df["latency_ms"] = pd.to_numeric(df["latency_ms"], errors="coerce")
+    df["success"] = pd.to_numeric(df["success"], errors="coerce")
+
+    # Per-file summary
+    summary = df.groupby("file").agg(
+        attempts=("success","count"),
+        successes=("success","sum"),
+        failures=("success", lambda s: s.size - s.sum()),
+        avg_latency_ms=("latency_ms","mean"),
+        p50_latency_ms=("latency_ms", "median"),
+        p90_latency_ms=("latency_ms", lambda s: s.quantile(0.9))
+    ).reset_index()
+    summary["task_completion_rate_percent"] = (summary["successes"] / summary["attempts"] * 100.0).round(2)
+
+    summary_path = os.path.join("results", "attempt_summary.csv")
+    summary.to_csv(summary_path, index=False)
+
+    # Overall totals
+    overall = {
+        "attempts": int(df.shape[0]),
+        "successes": int(df["success"].sum()),
+        "failures": int(df.shape[0] - df["success"].sum()),
+        "task_completion_rate_percent": round(float(df["success"].mean() * 100.0), 2),
+        "avg_latency_ms": round(float(df["latency_ms"].mean()), 2),
+        "p50_latency_ms": round(float(df["latency_ms"].median()), 2),
+        "p90_latency_ms": round(float(df["latency_ms"].quantile(0.9)), 2)
+    }
+    with open(os.path.join("results", "overall_summary.json"), "w", encoding="utf-8") as jf:
+        json.dump(overall, jf, indent=2)
+
+    print("Wrote:")
+    print(f" - {attempt_log_path}")
+    print(f" - {summary_path}")
+    print(" - results/overall_summary.json")
+    print("Transcripts saved in system_transcripts/")
+
+if __name__ == "__main__":
+    main()
 
